@@ -605,11 +605,18 @@ class BaseTrainer:
 
         The returned dict is expected to contain "fitness" key.
         """
-        _ = self.validator_train(self)
+        metrics_train = self.validator_train(self)
         metrics = self.validator(self)
         fitness = metrics.pop("fitness", -self.loss.detach().cpu().numpy())  # use loss as fitness measure if not found
+        metrics_train.pop("fitness", 0)
+        metrics_train.pop('val/box_loss', 0)
+        metrics_train.pop('val/cls_loss', 0)
+        metrics_train.pop('val/dfl_loss', 0)
         if not self.best_fitness or self.best_fitness < fitness:
             self.best_fitness = fitness
+        metrics_val = {k.replace("metrics", "val"):i for k, i in metrics.items()}
+        metrics_train = {k.replace("metrics", "train"):i for k, i in metrics_train.items()}
+        metrics = {**metrics_train, **metrics_val}
         return metrics, fitness
 
     def get_model(self, cfg=None, weights=None, verbose=True):
