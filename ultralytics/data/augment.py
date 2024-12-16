@@ -516,7 +516,7 @@ class Mosaic(BaseMixTransform):
         >>> augmented_labels = mosaic_aug(original_labels)
     """
 
-    def __init__(self, dataset, imgsz=640, p=1.0, n=4):
+    def __init__(self, dataset, imgsz=640, p=1.0, n=4, pre_transform=None):
         """
         Initializes the Mosaic augmentation object.
 
@@ -536,7 +536,7 @@ class Mosaic(BaseMixTransform):
         """
         assert 0 <= p <= 1.0, f"The probability should be in range [0, 1], but got {p}."
         assert n in {4, 9}, "grid must be equal to 4 or 9."
-        super().__init__(dataset=dataset, p=p)
+        super().__init__(dataset=dataset, p=p, pre_transform=pre_transform)
         self.imgsz = imgsz
         self.border = (-imgsz // 2, -imgsz // 2)  # width, height
         self.n = n
@@ -2268,6 +2268,181 @@ class RandomLoadText:
         labels["texts"] = texts
         return labels
 
+class RandomBarrelWarp:
+    """
+    Randomly apply Barrel Distortion.
+
+    This class will aplly a barrel distortion effect (https://i.sstatic.net/moLSo.png).
+    Applies from a certer C and with strenght S.
+
+    Attributes:
+        p (float): Probability of applying the flip. Must be between 0 and 1.
+
+    Methods:
+        __call__: Applies the warp to an image and its annotations.
+
+    Examples:
+        >>> transform = RandomBarrelWarp(p=0.5)
+        >>> result = transform({"img": image, "instances": instances})
+        >>> warped_image = result["img"]
+        >>> warped_instances = result["instances"]
+    """
+
+    def __init__(self, dataset, p=0.5) -> None:
+        """
+        Initializes the RandomBarrelWarp class with probability.
+
+        This class applies a random Barrel distortion to an image with a given probability.
+        It also updates any instances (bounding boxes, keypoints, etc.) accordingly.
+
+        Args:
+            p (float): The probability of applying the flip. Must be between 0 and 1.
+
+        Raises:
+            AssertionError: If p is not between 0 and 1.
+
+        Examples:
+            >>> flip = RandomBarrelWarp(p=0.5)
+        """
+        assert 0 <= p <= 1.0, f"The probability should be in range [0, 1], but got {p}."
+
+        self.p = p
+        self.create_barrel_map(dataset, (640,640), zoom_factor=4.0, strength=2.5)
+
+    def create_barrel_map(
+        self, dataset, imgsz, zoom_factor=2.0, strength=1.0, cx=0.5, cy=0.5, sx=1.0, sy=1.0
+    ):
+        """
+        Initiallizes attributes for barrel distortion remap.
+
+        Args:
+            zoom_factor (float): Maximum zoom factor at the center (>1 for zoom in).
+            strength (float): Controls how smoothly the zoom factor transitions from center to edges.
+        """
+        width, height = imgsz
+        center_x, center_y = width * cx, height * cy
+
+        # Create normalized coordinate grid
+        y, x = np.indices((height, width))
+        x = x - center_x
+        y = y - center_y
+        r = np.sqrt((x * sx) ** 2 + (y * sy) ** 2)
+        max_radius = np.max(r)
+
+        # Define scaling factor: zoom_factor at the center, 1.0 at the edges
+        scale = 1.0 + (zoom_factor - 1) * np.exp(-((r * strength / max_radius) ** 2))
+
+        # Avoid scaling less than 1
+        scale = np.maximum(scale, 1.0)  # unecessary, scale is always greater than 1
+
+        # Compute source coordinates
+        map_x = center_x + x / scale
+        map_y = center_y + y / scale
+
+        # Clip coordinates to image dimensions
+        self.map_x = np.clip(map_x, 0, width - 1).astype(np.float32)
+        self.map_y = np.clip(map_y, 0, height - 1).astype(np.float32)
+
+        self.map_inv_x = np.full_like(self.map_x, -1)
+        self.map_inv_y = np.full_like(self.map_y, -1)
+        # print("Lets work!!")
+        # for i in range(height):
+        #     for j in range(width):
+        #         wi, wj = self.find_warped_pixel(j,i)
+        #         self.map_inv_x[i,j] = wj
+        #         self.map_inv_y[i,j] = wi
+        # print("Work Done!!")
+
+    def find_warped_pixel(self, x, y):
+        xi, yi = int(x), int(y)
+        xi = xi if xi < 640 else 639
+        yi = yi if yi < 640 else 639
+        if self.map_inv_x[yi, yi] != -1: 
+            if self.map_inv_y[yi, xi] != -1:
+                return int(self.map_inv_x[yi,xi]), int(self.map_inv_y[yi,xi])
+        distance = np.abs(self.map_x - x) + np.abs(self.map_y - y)
+        clossest_pix = np.unravel_index(distance.argmin(), self.map_x.shape)
+        self.map_inv_x[yi, xi] = clossest_pix[1]
+        self.map_inv_y[yi, xi] = clossest_pix[0]
+        return clossest_pix[::-1]  # Return as (x, y)
+
+    def warp_rect(self, xywh):
+        cx, cy, w, h = xywh
+        top_left = (cx - w // 2, cy - h // 2)
+        top_right = (cx + w // 2, cy - h // 2)
+        bottom_right = (cx + w // 2, cy + h // 2)
+        bottom_left = (cx - w // 2, cy + h // 2)
+        w_tl = self.find_warped_pixel(*top_left)
+        w_tr = self.find_warped_pixel(*top_right)
+        w_br = self.find_warped_pixel(*bottom_right)
+        w_bl = self.find_warped_pixel(*bottom_left)
+        min_x = min(w_tl[0], w_tr[0], w_br[0], w_bl[0])
+        min_y = min(w_tl[1], w_tr[1], w_br[1], w_bl[1])
+        max_x = max(w_tl[0], w_tr[0], w_br[0], w_bl[0])
+        max_y = max(w_tl[1], w_tr[1], w_br[1], w_bl[1])
+        w, h = max_x - min_x, max_y - min_y
+        return min_x + w // 2, min_y + h // 2, w, h
+
+    def __call__(self, labels):
+        """
+        Applies random Barrel distortion to an image and updates any instances like bounding boxes or keypoints accordingly.
+
+        Args:
+            labels (Dict): A dictionary containing the following keys:
+                'img' (numpy.ndarray): The image to be distorted.
+                'instances' (ultralytics.utils.instance.Instances): An object containing bounding boxes and
+                    optionally keypoints.
+
+        Returns:
+            (Dict): The same dictionary with the distoted image and updated instances:
+                'img' (numpy.ndarray): The distorted image.
+                'instances' (ultralytics.utils.instance.Instances): Updated instances matching the distorted image.
+
+        Examples:
+            >>> labels = {"img": np.random.rand(640, 640, 3), "instances": Instances(...)}
+            >>> random_barrel = RandomBarrelWarp(p=0.5)
+            >>> warped_labels = random_barrel(labels)
+        """
+        # print("########### before ###########")
+        # print(f"{labels["ori_shape"]}")
+        # print(f"{labels["resized_shape"]}")
+        # print(f"{labels["ratio_pad"]}")
+        # print(f"normalized: {labels["instances"].normalized}")
+        # print(f"format: {labels["instances"]._bboxes.format}")
+        # print("########### before ###########")
+
+        letter_box = LetterBox((640,640))
+        labels = letter_box(labels=labels)
+        labels["instances"].convert_bbox("xywh")
+
+        # distorting the bboxes
+        for box in labels["instances"]._bboxes.bboxes:
+            box[:] = self.warp_rect(box)
+        labels["instances"].normalize(labels["resized_shape"][1],labels["resized_shape"][0])
+
+        img = cv2.imread(labels["im_file"])
+        # Apply remapping
+        img = cv2.remap(
+            labels["img"],
+            self.map_x,
+            self.map_y,
+            interpolation=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=(114, 114, 114),
+        )
+        img = cv2.resize(img, (320,320), interpolation=cv2.INTER_LINEAR)
+        labels["img"] = img
+        labels["resized_shape"] = (320,320)
+
+        # print("########### after ###########")
+        # print(f"{labels["ori_shape"]}")
+        # print(f"{labels["resized_shape"]}")
+        # print(f"{labels["ratio_pad"]}")
+        # print(f"normalized: {labels["instances"].normalized}")
+        # print(f"format: {labels["instances"]._bboxes.format}")
+        # print("########### after ###########")
+
+        return labels
 
 def v8_transforms(dataset, imgsz, hyp, stretch=False):
     """
@@ -2293,7 +2468,8 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
         >>> transforms = v8_transforms(dataset, imgsz=640, hyp=hyp)
         >>> augmented_data = transforms(dataset[0])
     """
-    mosaic = Mosaic(dataset, imgsz=imgsz, p=hyp.mosaic)
+    barrel = RandomBarrelWarp(dataset, p=1.0)
+    mosaic = Mosaic(dataset, imgsz=imgsz, pre_transform=barrel, p=hyp.mosaic)
     affine = RandomPerspective(
         degrees=hyp.degrees,
         translate=hyp.translate,
@@ -2303,7 +2479,7 @@ def v8_transforms(dataset, imgsz, hyp, stretch=False):
         pre_transform=None if stretch else LetterBox(new_shape=(imgsz, imgsz)),
     )
 
-    pre_transform = Compose([mosaic, affine])
+    pre_transform = Compose([barrel, mosaic, affine])
     if hyp.copy_paste_mode == "flip":
         pre_transform.insert(1, CopyPaste(p=hyp.copy_paste, mode=hyp.copy_paste_mode))
     else:
